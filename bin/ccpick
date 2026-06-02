@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+#
+# ccpick — Claude Code 플랜 셀렉터
+#
+# ~/.config/ccpick/plans.env 에 정의된 플랜 중 하나를 fzf(없으면 select)로 고른 뒤,
+# 해당 플랜의 CLAUDE_CODE_OAUTH_TOKEN 을 주입하여 대화형 claude 를 실행한다.
+# 설정(~/.claude)·히스토리·프로젝트는 그대로 공유되고, 플랜(토큰)만 분리된다.
+#
+set -euo pipefail
+
+PLANS_FILE="${CCPICK_PLANS:-${XDG_CONFIG_HOME:-$HOME/.config}/ccpick/plans.env}"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# ── plans.env 파싱 ────────────────────────────────────────────────────────────
+# 형식은 한 줄에 '<이름>=<토큰>' 하나. '#' 으로 시작하는 줄과 빈 줄은 무시하고,
+# 이름·값의 앞뒤 공백은 트림한다. 아래 세 함수가 이 규칙을 공유한다.
+
+# 플랜 이름을 한 줄에 하나씩 출력 (파일이 없으면 아무것도 출력하지 않는다).
+plan_names() {
+  [[ -f "$PLANS_FILE" ]] || return 0
+  awk -F= '
+    !/^[[:space:]]*#/ && /=/ {
+      n=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", n); print n
+    }' "$PLANS_FILE"
+}
+
+# 주어진 이름의 토큰을 출력 (첫 '=' 뒤 전체를 트림; 없으면 빈 출력).
+plan_token() {
+  awk -F= -v p="$1" '
+    !/^[[:space:]]*#/ && /=/ {
+      n=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", n)
+      if (n==p) { sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }
+    }' "$PLANS_FILE"
+}
+
+# 이름이 이미 정의돼 있으면 성공(0), 없으면 실패(1).
+plan_exists() {
+  plan_names | awk -v p="$1" 'BEGIN{c=1} $0==p{c=0} END{exit c}'
+}
+
+# ── 환경 점검 ────────────────────────────────────────────────────────────────
+
+# plans.env 준비: 디렉터리 생성 + 권한 600 보장 (없으면 빈 파일 생성).
+ensure_plans_file() {
+  local dir; dir="$(dirname "$PLANS_FILE")"
+  mkdir -p "$dir"
+  [[ -f "$PLANS_FILE" ]] || ( umask 077; : > "$PLANS_FILE" )
+  chmod 600 "$PLANS_FILE"
+}
+
+# 평문 토큰 파일이 600 이 아니면 경고한다.
+# stat 은 GNU/Linux(-c)와 BSD/macOS(-f) 문법을 차례로 시도한다.
+# (GNU 를 먼저: macOS 의 stat -c 는 출력 없이 실패하지만, GNU 의 stat -f 는
+#  파일시스템 정보를 stdout 에 찍어 값을 오염시킨다.)
+# 둘 다 실패하면 값이 비어 조용히 통과한다.
+warn_if_insecure_perms() {
+  local perms
+  perms="$(stat -c '%a' "$PLANS_FILE" 2>/dev/null \
+        || stat -f '%Lp' "$PLANS_FILE" 2>/dev/null || true)"
+  [[ -n "$perms" && "$perms" != "600" ]] && \
+    printf '경고: %s 권한이 %s 입니다. chmod 600 권장.\n' "$PLANS_FILE" "$perms" >&2
+  return 0
+}
+
+# Claude 설정이 logout/온보딩 미완료 상태면 경고 후 진행 여부를 확인한다 (best-effort).
+# 토큰(env)은 인증만 대체하고 온보딩·관리설정 승인 상태는 ~/.claude.json 에 저장되므로,
+# logout 상태에서 토큰만 주입하면 theme 선택 등 첫 실행 온보딩이 다시 표시된다.
+# 설정 파일이 없거나 형식이 예상과 다르면 조용히 통과한다.
+warn_if_logged_out() {
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  [[ -f "$cfg" ]] || return 0
+  # hasCompletedOnboarding=true 이고 oauthAccount 가 null 이 아니면 정상으로 본다.
+  # 두 키 모두 top-level 에 한 번씩만 등장하므로 줄 단위 패턴 검색으로 충분하다.
+  if awk '
+    /"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true/ { onboarded=1 }
+    /"oauthAccount"[[:space:]]*:[[:space:]]*null/           { logged_out=1 }
+    /"oauthAccount"[[:space:]]*:/                           { account_seen=1 }
+    END { exit !(onboarded && account_seen && !logged_out) }
+  ' "$cfg"; then
+    return 0
+  fi
+
+  printf '경고: Claude 설정(%s)이 logout/온보딩 미완료 상태입니다.\n' "$cfg" >&2
+  printf '  토큰(env)은 인증만 대체하므로, 이대로 실행하면 theme 선택·관리설정 승인 등\n' >&2
+  printf '  첫 실행 온보딩이 표시됩니다. claude 에 한 번 정상 로그인해 온보딩을 끝내두면\n' >&2
+  printf '  이후 ccpick 실행에는 표시되지 않습니다.\n' >&2
+  if [[ -t 0 ]]; then
+    printf '  계속하려면 Enter, 중단하려면 Ctrl-C: ' >&2
+    read -r _ || exit 130
+  fi
+}
+
+# ── 서브커맨드: add ──────────────────────────────────────────────────────────
+
+# ccpick add <이름> : claude setup-token 으로 토큰을 만들어 plans.env 에 추가한다.
+cmd_add() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "사용법: ccpick add <플랜이름>"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "플랜 이름은 영문/숫자/.-_ 만 허용됩니다: $name"
+  command -v claude >/dev/null 2>&1 || die "claude CLI 를 찾을 수 없습니다"
+
+  ensure_plans_file
+  if plan_exists "$name"; then
+    die "이미 존재하는 플랜입니다: $name
+다른 이름을 쓰거나 $PLANS_FILE 을 직접 편집하세요."
+  fi
+
+  # setup-token 출력을 임시 파일로 떠서(화면에도 표시) 토큰 패턴만 추출한다.
+  local tmp; tmp="$( umask 077; mktemp "${TMPDIR:-/tmp}/ccpick.XXXXXX" )" \
+    || die "임시 파일 생성 실패"
+  # trap 발동(EXIT)은 함수 종료 후이므로 local tmp 가 소멸한다.
+  # 설정 시점에 경로 값을 박아넣어 unbound 를 피한다.
+  trap "rm -f '$tmp'" EXIT
+
+  printf '▶ claude setup-token 을 실행합니다. 브라우저 안내에 따라 로그인하세요.\n' >&2
+  if ! claude setup-token | tee "$tmp" >&2; then
+    die "claude setup-token 실행에 실패했습니다."
+  fi
+
+  local token
+  token="$(awk 'match($0,/sk-ant-oat[0-9A-Za-z]+-[A-Za-z0-9_-]+/){print substr($0,RSTART,RLENGTH)}' "$tmp" | tail -n1 || true)"
+  [[ -n "$token" ]] || die "토큰을 캡처하지 못했습니다.
+setup-token 출력에서 'sk-ant-oat...' 형식의 토큰을 찾지 못했습니다.
+토큰이 stdout 으로 출력되지 않는 경우일 수 있습니다."
+
+  printf '%s=%s\n' "$name" "$token" >> "$PLANS_FILE"
+  printf '\n✔ 플랜 추가됨: %s\n  파일: %s\n' "$name" "$PLANS_FILE" >&2
+}
+
+# ── 기본 동작: 플랜 선택 후 claude 실행 ──────────────────────────────────────
+
+# 플랜 이름 목록(개행 구분)을 받아 사용자가 고른 하나를 출력한다.
+# fzf 가 있으면 fzf, 없으면 bash select 로 폴백한다. 취소하면 비-0 으로 끝난다.
+select_plan() {
+  local names="$1"
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$names" | fzf --prompt='plan> ' --height=40% --reverse
+    return
+  fi
+
+  local -a arr=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && arr+=("$line")
+  done <<< "$names"
+
+  local choice
+  PS3='plan> '
+  select choice in "${arr[@]}"; do
+    [[ -n "$choice" ]] && { printf '%s\n' "$choice"; return 0; }
+    printf '잘못된 선택입니다. 번호로 고르세요 (Ctrl-C 로 취소).\n' >&2
+  done
+  return 1  # Ctrl-D(EOF) 로 메뉴를 빠져나온 경우
+}
+
+# 플랜을 골라 토큰을 주입하고 대화형 claude 를 실행한다 (인자는 그대로 전달).
+main() {
+  command -v claude >/dev/null 2>&1 || die "claude CLI 를 찾을 수 없습니다"
+
+  [[ -f "$PLANS_FILE" ]] || die "플랜 파일이 없습니다: $PLANS_FILE
+다음 형식으로 만든 뒤 'chmod 600' 하세요:
+  pro=sk-ant-oat01-...
+  max=sk-ant-oat01-..."
+
+  warn_if_insecure_perms
+
+  local names; names="$(plan_names)"
+  [[ -n "$names" ]] || die "플랜이 정의되어 있지 않습니다: $PLANS_FILE"
+
+  local plan; plan="$(select_plan "$names")" || exit 130
+  [[ -n "$plan" ]] || exit 130
+
+  local token; token="$(plan_token "$plan")"
+  [[ -n "$token" ]] || die "토큰을 찾을 수 없습니다: $plan"
+
+  # 토큰 주입 후 대화형 claude 실행.
+  # 이 프로세스에만 export 되므로 부모 셸은 오염되지 않는다.
+  # 플랜 이름(CCPICK_PLAN)도 함께 주입해, 실행된 세션 안에서
+  # 'echo $CCPICK_PLAN' 으로 어떤 플랜인지 확인할 수 있게 한다.
+  printf '▶ plan: %s\n' "$plan" >&2
+  warn_if_logged_out
+  export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  export CCPICK_PLAN="$plan"
+  exec claude "$@"
+}
+
+# ── 서브커맨드 디스패치 (기본: 플랜 선택 후 claude 실행) ──────────────────────
+case "${1:-}" in
+  add) shift; cmd_add "$@"; exit 0 ;;
+esac
+main "$@"

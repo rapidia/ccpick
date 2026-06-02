@@ -1,0 +1,11 @@
+# 토큰이 담긴 평문 파일은 절대 커밋하지 않는다 (예시 파일 *.example 은 제외)
+# plans.env 는 *.env 에 포함되지만, 핵심 차단 대상이므로 명시적으로도 적는다.
+*.env
+plans.env
+
+# Claude Code 머신별 로컬 설정 (권한 허용 목록 등).
+# 전역 ignore(~/.config/git/ignore)에 의존하지 않도록 저장소에서도 차단한다.
+.claude/settings.local.json
+
+# macOS
+.DS_Store
